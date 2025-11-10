@@ -22,6 +22,8 @@ For any feedback, questions, or bugs, please file a Github issue or start a Gith
 ### Updates in Version 3.5.x
 * 1-indexing of output volumes and epochs replacing the previous 0-indexing
 * [NEW] volume reconstruction using an autodecoder with `cryodrgn train_dec` *(beta)*
+* [NEW] Apple Silicon (M-Series) GPU support via Metal Performance Shaders (MPS)
+* [NEW] device selection with `--device` flag (cuda/mps/cpu)
 * [NEW] `cryodrgn parse_relion` for parsing RELION5 3D tomo files to the cryoDRGN 2D input format
 * improved landscape analysis using Leiden clustering
 * official support for Python 3.12, deprecating support for Python 3.9
@@ -365,6 +367,38 @@ are affected (fewer model updates per epoch with larger `-b`).
 Thus, using `--multigpu` may require increasing the total number of epochs. As a best practice, we recommend
 first training for 25 epochs (or however many is practical for your dataset size), and then doubling to 50 epochs
 to check for model convergence by inspecting if the final results have changed.
+
+### GPU device selection and Apple Silicon support
+
+CryoDRGN now supports multiple GPU backends including NVIDIA CUDA, Apple Metal (M-Series chips), and CPU-only mode.
+By default, cryoDRGN will automatically detect and use the best available device in this priority order: CUDA > MPS (Metal) > CPU.
+
+To explicitly select a device, use the `--device` flag:
+
+    $ cryodrgn train_vae ... --device cuda   # Force NVIDIA CUDA GPU
+    $ cryodrgn train_vae ... --device mps    # Force Apple Metal (M-Series)
+    $ cryodrgn train_vae ... --device cpu    # Force CPU-only mode
+
+**Apple Silicon (M-Series) Support:**
+
+CryoDRGN can now run on M1, M2, M3, and newer Apple Silicon Macs using Metal Performance Shaders (MPS) for GPU acceleration.
+This enables training and analysis on MacBook Pro, MacBook Air, Mac Studio, and Mac Mini without requiring NVIDIA GPUs.
+
+Key considerations for Apple Silicon:
+* Requires PyTorch >= 2.0.0 with MPS support
+* MPS backend provides significant speedup over CPU on M-Series chips
+* Mixed precision training is supported but may have different performance characteristics than CUDA
+* Multi-GPU training (`--multigpu`) is not supported on MPS due to Apple's unified memory architecture
+* Initial MPS support may have different performance compared to optimized CUDA implementations
+
+Example usage on M-Series Mac:
+
+    $ cryodrgn train_vae particles.128.mrcs \
+            --poses pose.pkl \
+            --ctf ctf.pkl \
+            -o output/cryodrgn_mps \
+            --zdim 8 -n 25 \
+            --device mps  # Use Metal GPU acceleration
 
 ### Local pose refinement -- *beta*
 

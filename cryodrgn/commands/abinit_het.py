@@ -27,7 +27,7 @@ from torch.nn.parallel import DataParallel
 from typing import Union
 
 from cryodrgn.commands.analyze import main as analyze_main, add_args as add_analyze_args
-from cryodrgn import ctf, dataset, lie_tools, utils
+from cryodrgn import ctf, dataset, device_utils, lie_tools, utils
 from cryodrgn.beta_schedule import LinearSchedule, get_beta_schedule
 import cryodrgn.config
 from cryodrgn.lattice import Lattice
@@ -248,6 +248,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="amp",
         help="Do not use mixed-precision training for accelerating training",
+    )
+    group.add_argument(
+        "--device",
+        choices=["cuda", "mps", "cpu"],
+        default=None,
+        help="Device to use for training (default: auto-detect)",
     )
     group.add_argument(
         "--multigpu",
@@ -478,6 +484,7 @@ def train(
     ctf_params=None,
     use_amp=False,
     scaler=None,
+    device_str="cuda",
 ):
     y, yt = minibatch
     use_tilt = yt is not None
@@ -497,13 +504,7 @@ def train(
     # TODO: Center image?
     # We do this in pose-supervised train_vae
 
-    if scaler is not None:
-        try:
-            amp_mode = torch.amp.autocast("cuda")
-        except AttributeError:
-            amp_mode = torch.cuda.amp.autocast_mode.autocast()
-    else:
-        amp_mode = contextlib.nullcontext()
+    amp_mode = device_utils.get_autocast_context(device_str, enabled=use_amp)
 
     with amp_mode:
         # VAE inference of z
@@ -778,11 +779,13 @@ def main(args):
     torch.manual_seed(args.seed)
 
     # set the device
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-    logger.info("Use cuda {}".format(use_cuda))
-    if not use_cuda:
-        logger.warning("WARNING: No GPUs detected")
+    device, device_str = device_utils.get_available_device(
+        device=args.device, verbose=True
+    )
+    device_utils.log_device_info(device_str)
+
+    # Legacy compatibility
+    use_cuda = device_str == "cuda"
 
     # set beta schedule
     if args.beta is None:
@@ -910,15 +913,16 @@ def main(args):
                 "-- AMP training speedup is not optimized!"
             )
 
-        # mixed precision with apex.amp
-        try:
-            model, optim = amp.initialize(model, optim, opt_level="O1")
-        # mixed precision with pytorch (v1.6+)
-        except:  # noqa: E722
+        # mixed precision with apex.amp (CUDA only)
+        if device_str == "cuda":
             try:
-                scaler = torch.amp.GradScaler("cuda")
-            except AttributeError:
-                scaler = torch.cuda.amp.grad_scaler.GradScaler()
+                model, optim = amp.initialize(model, optim, opt_level="O1")
+            except:  # noqa: E722
+                # Fall back to PyTorch native mixed precision
+                scaler = device_utils.get_grad_scaler(device_str, enabled=True)
+        else:
+            # For MPS and other devices, use PyTorch native mixed precision
+            scaler = device_utils.get_grad_scaler(device_str, enabled=True)
 
     sorted_poses = []
     if args.load:
@@ -951,15 +955,16 @@ def main(args):
         start_epoch = 1
 
     # parallelize
-    if args.multigpu and torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs!")
-        args.batch_size *= torch.cuda.device_count()
-        logger.info(f"Increasing batch size to {args.batch_size}")
-        model = DataParallel(model)
-    elif args.multigpu:
-        logger.warning(
-            f"WARNING: --multigpu selected, but {torch.cuda.device_count()} GPUs detected"
-        )
+    if args.multigpu:
+        if device_utils.supports_multi_gpu(device_str):
+            logger.info(f"Using {torch.cuda.device_count()} GPUs!")
+            args.batch_size *= torch.cuda.device_count()
+            logger.info(f"Increasing batch size to {args.batch_size}")
+            model = DataParallel(model)
+        else:
+            logger.warning(
+                f"WARNING: --multigpu selected, but multi-GPU not supported for {device_str} device"
+            )
 
     if args.pose_model_update_freq:
         if args.multigpu:
@@ -1102,6 +1107,7 @@ def main(args):
                 ctf_params=ctf_i,
                 use_amp=args.amp,
                 scaler=scaler,
+                device_str=device_str,
             )
             # logging
             poses.append((ind.cpu().numpy(), pose))

@@ -23,6 +23,7 @@ from cryodrgn.models import DataParallelDecoder, Decoder
 from cryodrgn.source import write_mrc
 import cryodrgn.config
 from cryodrgn.commands.analyze import main as analyze_main, add_args as add_analyze_args
+from cryodrgn import device_utils
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="amp",
         help="Do not use mixed-precision training",
+    )
+    group.add_argument(
+        "--device",
+        choices=["cuda", "mps", "cpu"],
+        default=None,
+        help="Compute device (default: auto-detect cuda > mps > cpu)",
     )
     group.add_argument(
         "--multigpu",
@@ -342,12 +349,9 @@ def train(
             y = lattice.translate_ht(y, trans.unsqueeze(1), mask).view(B, -1)
         return F.mse_loss(yhat, y)
 
-    # Cast operations to mixed precision if using torch.cuda.amp.GradScaler()
+    # Cast operations to mixed precision if using GradScaler
     if scaler is not None:
-        try:
-            amp_mode = torch.amp.autocast("cuda")
-        except AttributeError:
-            amp_mode = torch.cuda.amp.autocast_mode.autocast()
+        amp_mode = device_utils.get_autocast_context(device_str, enabled=True)
         with amp_mode:
             loss = run_model(y)
     else:
@@ -441,12 +445,13 @@ def main(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
 
     # set the device
-    use_cuda = torch.cuda.is_available()
-    device_str = "cuda" if use_cuda else "cpu"
-    device = torch.device(device_str)
-    logger.info("Use cuda {}".format(use_cuda))
-    if not use_cuda:
-        logger.warning("WARNING: No GPUs detected")
+    device, device_str = device_utils.get_available_device(
+        device=args.device, verbose=True
+    )
+    device_utils.log_device_info(device_str)
+
+    # Legacy compatibility
+    use_cuda = device_str == "cuda"
 
     # load the particles
     if args.ind is not None:
@@ -577,27 +582,28 @@ def main(args: argparse.Namespace) -> None:
                 f"and thus not optimal for AMP training!"
             )
 
-        # mixed precision with apex.amp
-        try:
-            model, optim = amp.initialize(model, optim, opt_level="O1")
-        # Mixed precision with pytorch (v1.6+)
-        except:  # noqa: E722
+        # mixed precision with apex.amp (CUDA only)
+        if device_str == "cuda":
             try:
-                scaler = torch.amp.GradScaler("cuda")
-            except AttributeError:
-                scaler = torch.cuda.amp.grad_scaler.GradScaler()
+                model, optim = amp.initialize(model, optim, opt_level="O1")
+            except:  # noqa: E722
+                # Fall back to PyTorch native mixed precision
+                scaler = device_utils.get_grad_scaler(device_str, enabled=True)
+        else:
+            # For MPS and other devices, use PyTorch native mixed precision
+            scaler = device_utils.get_grad_scaler(device_str, enabled=True)
 
     # parallelize
-    if args.multigpu and torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs!")
-        args.batch_size *= torch.cuda.device_count()
-        logger.info(f"Increasing batch size to {args.batch_size}")
-        model = DataParallelDecoder(model)
-    elif args.multigpu:
-        logger.info(
-            f"WARNING: --multigpu selected, "
-            f"but {torch.cuda.device_count()} GPUs detected"
-        )
+    if args.multigpu:
+        if device_utils.supports_multi_gpu(device_str):
+            logger.info(f"Using {torch.cuda.device_count()} GPUs!")
+            args.batch_size *= torch.cuda.device_count()
+            logger.info(f"Increasing batch size to {args.batch_size}")
+            model = DataParallelDecoder(model)
+        else:
+            logger.warning(
+                f"WARNING: --multigpu selected, but multi-GPU not supported for {device_str} device"
+            )
 
     # train
     data_generator = dataset.make_dataloader(

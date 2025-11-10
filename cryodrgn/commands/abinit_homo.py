@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cryodrgn import ctf, dataset, lie_tools, models, utils
+from cryodrgn import ctf, dataset, device_utils, lie_tools, models, utils
 from cryodrgn.lattice import Lattice
 from cryodrgn.pose_search import PoseSearch
 from cryodrgn.source import write_mrc
@@ -217,6 +217,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="amp",
         help="Do not use mixed-precision training for accelerating training",
+    )
+    group.add_argument(
+        "--device",
+        choices=["cuda", "mps", "cpu"],
+        default=None,
+        help="Compute device to use (default: auto-detect)",
     )
 
     group = parser.add_argument_group("Pose search parameters")
@@ -421,10 +427,8 @@ def train(
         )
 
     if scaler is not None:
-        try:
-            amp_mode = torch.amp.autocast("cuda")
-        except AttributeError:
-            amp_mode = torch.cuda.amp.autocast_mode.autocast()
+        device_type = str(y.device).split(":")[0]
+        amp_mode = device_utils.get_autocast_context(device_type)
     else:
         amp_mode = contextlib.nullcontext()
 
@@ -564,11 +568,13 @@ def main(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
 
     # set the device
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-    logger.info("Use cuda {}".format(use_cuda))
-    if not use_cuda:
-        logger.warning("WARNING: No GPUs detected")
+    device, device_str = device_utils.get_available_device(
+        device=args.device, verbose=True
+    )
+    device_utils.log_device_info(device_str)
+
+    # Legacy compatibility
+    use_cuda = device_str == "cuda"
 
     # load the particles
     if args.ind is not None:
@@ -672,9 +678,12 @@ def main(args: argparse.Namespace) -> None:
         # mixed precision with pytorch (v1.6+)
         except:  # noqa: E722
             try:
-                scaler = torch.amp.GradScaler("cuda")
+                scaler = torch.amp.GradScaler(device_str)
             except AttributeError:
-                scaler = torch.cuda.amp.grad_scaler.GradScaler()
+                if device_str == "cuda":
+                    scaler = torch.cuda.amp.grad_scaler.GradScaler()
+                else:
+                    scaler = torch.amp.GradScaler(device_str)
 
     sorted_poses = []
     if args.load:
