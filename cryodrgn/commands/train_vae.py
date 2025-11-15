@@ -389,6 +389,7 @@ def train_batch(
     use_amp: bool = False,
     scaler=None,
     dose_filters=None,
+    device_str: str = "cuda",
 ):
     optim.zero_grad()
     model.train()
@@ -977,6 +978,7 @@ def main(args: argparse.Namespace) -> None:
                 use_amp=args.amp,
                 scaler=scaler,
                 dose_filters=dose_filters,
+                device_str=device_str,
             )
             if pose_optimizer is not None and epoch >= args.pretrain:
                 pose_optimizer.step()

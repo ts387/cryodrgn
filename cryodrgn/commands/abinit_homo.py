@@ -412,6 +412,7 @@ def train(
     ctf_params=None,
     use_amp=False,
     scaler=None,
+    device_str="cuda",
 ):
     y, yt = batch
     B = y.size(0)
@@ -427,8 +428,7 @@ def train(
         )
 
     if scaler is not None:
-        device_type = str(y.device).split(":")[0]
-        amp_mode = device_utils.get_autocast_context(device_type)
+        amp_mode = device_utils.get_autocast_context(device_str, enabled=True)
     else:
         amp_mode = contextlib.nullcontext()
 
@@ -811,6 +811,7 @@ def main(args: argparse.Namespace) -> None:
                 ctf_params=c,
                 use_amp=args.amp,
                 scaler=scaler,
+                device_str=device_str,
             )
             poses.append((ind.cpu().numpy(), pose))
             base_poses.append((ind_np, base_pose))

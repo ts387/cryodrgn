@@ -325,6 +325,7 @@ def train(
     ctf_params=None,
     use_amp=False,
     scaler=None,
+    device_str="cuda",
 ):
     model.train()
     optim.zero_grad()
@@ -636,6 +637,7 @@ def main(args: argparse.Namespace) -> None:
                 c,
                 use_amp=args.amp,
                 scaler=scaler,
+                device_str=device_str,
             )
             if epoch >= args.pretrain_z:
                 z_optim.step()

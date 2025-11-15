@@ -51,7 +51,7 @@ def get_available_device(
             if not torch.backends.mps.is_available():
                 raise RuntimeError(
                     "MPS device requested but MPS is not available. "
-                    "Please ensure you are running on Apple Silicon with PyTorch >= 1.12."
+                    "Please ensure you are running on Apple Silicon with PyTorch >= 2.0.0."
                 )
             device_obj = torch.device("mps")
             if verbose:
@@ -106,10 +106,14 @@ def supports_mixed_precision(device_type: str) -> bool:
     elif device_type == "mps":
         # MPS has experimental AMP support in PyTorch >= 2.0
         # Check if the required functionality is available
+        if not torch.backends.mps.is_available():
+            return False
         try:
-            # Test if MPS autocast is available
-            return hasattr(torch.amp, "autocast") and torch.backends.mps.is_available()
-        except Exception:
+            # Test if MPS autocast context can be created
+            with torch.amp.autocast("mps"):
+                pass
+            return True
+        except (AttributeError, TypeError, RuntimeError):
             return False
     else:
         # CPU AMP exists but typically not recommended
