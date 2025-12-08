@@ -48,6 +48,110 @@ import cryodrgn.config
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Focus Mask Utilities for Real-Space Loss Computation
+# =============================================================================
+
+
+def load_focus_mask(
+    mask_path: str,
+    image_size: int,
+    device: torch.device,
+    threshold: float = 0.0,
+) -> torch.Tensor:
+    """Load and validate a real-space focus mask.
+
+    Args:
+        mask_path: Path to .mrc mask file
+        image_size: Expected image size (ny, before symmetrization)
+        device: Torch device
+        threshold: If > 0, binarize mask at this threshold
+
+    Returns:
+        Focus mask tensor of shape (image_size, image_size)
+    """
+    from cryodrgn.mrcfile import parse_mrc
+
+    mask_data, header = parse_mrc(mask_path)
+
+    # Handle 3D mask (take central slice) or 2D mask
+    if mask_data.ndim == 3:
+        if mask_data.shape[0] == 1:
+            mask_data = mask_data[0]
+        else:
+            # Take central slice for 3D volumes
+            central_idx = mask_data.shape[0] // 2
+            mask_data = mask_data[central_idx]
+            logger.warning(
+                f"3D mask provided, using central slice (z={central_idx})"
+            )
+
+    assert mask_data.ndim == 2, f"Focus mask must be 2D, got shape {mask_data.shape}"
+    assert mask_data.shape[0] == mask_data.shape[1] == image_size, (
+        f"Focus mask size {mask_data.shape} does not match image size {image_size}"
+    )
+
+    mask = torch.tensor(mask_data, dtype=torch.float32, device=device)
+
+    # Normalize to [0, 1]
+    mask_min, mask_max = mask.min(), mask.max()
+    if mask_max > mask_min:
+        mask = (mask - mask_min) / (mask_max - mask_min)
+
+    # Optional binarization
+    if threshold > 0:
+        mask = (mask > threshold).float()
+        logger.info(f"Binarized focus mask at threshold {threshold}")
+
+    logger.info(
+        f"Loaded focus mask from {mask_path}: "
+        f"shape={tuple(mask.shape)}, range=[{mask.min():.3f}, {mask.max():.3f}], "
+        f"coverage={mask.mean():.1%}"
+    )
+
+    return mask
+
+
+def unsymmetrize_ht(ht_sym: torch.Tensor) -> torch.Tensor:
+    """Remove symmetrization from Hartley-transformed images.
+
+    Args:
+        ht_sym: Symmetrized Hartley transform of shape (..., D, D) where D = ny + 1
+
+    Returns:
+        Unsymmetrized Hartley transform of shape (..., ny, ny)
+    """
+    return ht_sym[..., :-1, :-1]
+
+
+def hartley_to_real(
+    ht: torch.Tensor,
+    norm: tuple,
+) -> torch.Tensor:
+    """Convert normalized symmetrized Hartley coefficients to real-space images.
+
+    Args:
+        ht: Normalized symmetrized Hartley transform, shape (B, D, D) where D = ny + 1
+        norm: Tuple of (mean, std) used for normalization
+
+    Returns:
+        Real-space images of shape (B, ny, ny)
+    """
+    from cryodrgn import fft
+
+    # Denormalize
+    ht_denorm = ht * norm[1] + norm[0]
+
+    # Unsymmetrize: (D, D) -> (ny, ny) where ny = D - 1
+    ht_unsym = unsymmetrize_ht(ht_denorm)
+
+    # Inverse Hartley transform
+    # Note: Hartley transform is self-inverse up to scaling
+    real = fft.iht2_center(ht_unsym)
+
+    return real
+
+
 def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "particles",
@@ -257,6 +361,19 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Parallelize training across all detected GPUs",
     )
+    group.add_argument(
+        "--focus-mask",
+        type=os.path.abspath,
+        metavar="MRC",
+        help="Real-space focus mask (.mrc) for masked loss computation. "
+        "When provided, loss is computed in real space within the masked region.",
+    )
+    group.add_argument(
+        "--focus-mask-threshold",
+        type=float,
+        default=0.0,
+        help="Threshold for binarizing focus mask (default: %(default)s, i.e., use soft mask)",
+    )
 
     group = parser.add_argument_group("Pose SGD")
     group.add_argument(
@@ -382,6 +499,8 @@ def train_batch(
     use_amp: bool = False,
     scaler=None,
     dose_filters=None,
+    focus_mask=None,
+    data_norm=None,
 ):
     optim.zero_grad()
     model.train()
@@ -398,8 +517,8 @@ def train_batch(
         amp_mode = contextlib.nullcontext()
 
     with amp_mode:
-        z_mu, z_logvar, z, y_recon, mask = run_batch(
-            model, lattice, y, rot, ntilts, ctf_params, yr
+        z_mu, z_logvar, z, y_recon, fourier_mask = run_batch(
+            model, lattice, y, rot, ntilts, ctf_params, yr, focus_mask=focus_mask
         )
         loss, gen_loss, kld = loss_function(
             z_mu,
@@ -407,10 +526,12 @@ def train_batch(
             y,
             ntilts,
             y_recon,
-            mask,
+            fourier_mask,
             beta,
             beta_control,
             dose_filters,
+            focus_mask=focus_mask,
+            data_norm=data_norm,
         )
 
     if use_amp:
@@ -437,7 +558,16 @@ def preprocess_input(y, lattice, trans):
     return y
 
 
-def run_batch(model, lattice, y, rot, ntilts: Optional[int], ctf_params=None, yr=None):
+def run_batch(
+    model,
+    lattice,
+    y,
+    rot,
+    ntilts: Optional[int],
+    ctf_params=None,
+    yr=None,
+    focus_mask=None,
+):
     use_ctf = ctf_params is not None
     B = y.size(0)
     D = lattice.D
@@ -463,12 +593,23 @@ def run_batch(model, lattice, y, rot, ntilts: Optional[int], ctf_params=None, yr
         z = torch.repeat_interleave(z, ntilts, dim=0)
 
     # decode
-    mask = lattice.get_circular_mask(D // 2)  # restrict to circular mask
-    y_recon = model(lattice.coords[mask] / lattice.extent / 2 @ rot, z).view(B, -1)
-    if c is not None:
-        y_recon *= c.view(B, -1)[:, mask]
-
-    return z_mu, z_logvar, z, y_recon, mask
+    if focus_mask is not None:
+        # REAL-SPACE LOSS PATH: Evaluate full Fourier grid
+        y_recon = model(lattice.coords / lattice.extent / 2 @ rot, z).view(B, D, D)
+        if c is not None:
+            y_recon = y_recon * c  # Apply CTF (full grid)
+        # Return full grid; fourier_mask=None signals real-space loss mode
+        fourier_mask = None
+        return z_mu, z_logvar, z, y_recon, fourier_mask
+    else:
+        # ORIGINAL FOURIER-SPACE LOSS PATH
+        fourier_mask = lattice.get_circular_mask(D // 2)  # restrict to circular mask
+        y_recon = model(
+            lattice.coords[fourier_mask] / lattice.extent / 2 @ rot, z
+        ).view(B, -1)
+        if c is not None:
+            y_recon *= c.view(B, -1)[:, fourier_mask]
+        return z_mu, z_logvar, z, y_recon, fourier_mask
 
 
 def loss_function(
@@ -477,17 +618,49 @@ def loss_function(
     y,
     ntilts: Optional[int],
     y_recon,
-    mask,
+    fourier_mask,
     beta: float,
     beta_control=None,
     dose_filters=None,
+    focus_mask=None,
+    data_norm=None,
 ):
-    # reconstruction error
     B = y.size(0)
-    y = y.view(B, -1)[:, mask]
-    if dose_filters is not None:
-        y_recon = torch.mul(y_recon, dose_filters[:, mask])
-    gen_loss = F.mse_loss(y_recon, y)
+
+    if focus_mask is not None:
+        # REAL-SPACE LOSS with focus mask
+        assert fourier_mask is None, "fourier_mask should be None when using focus_mask"
+        assert data_norm is not None, "data_norm required for real-space loss"
+
+        # Convert prediction to real space
+        # y_recon is full (B, D, D) Hartley grid with CTF already applied
+        y_recon_real = hartley_to_real(y_recon, data_norm)
+
+        # Convert target to real space
+        # y is normalized symmetrized Hartley (B, D, D)
+        y_target_real = hartley_to_real(y, data_norm)
+
+        # Apply focus mask and compute loss
+        # focus_mask is (ny, ny), y_*_real is (B, ny, ny)
+        y_recon_masked = y_recon_real * focus_mask
+        y_target_masked = y_target_real * focus_mask
+
+        # Compute MSE loss normalized by mask area
+        mask_sum = focus_mask.sum()
+        gen_loss = (
+            F.mse_loss(y_recon_masked, y_target_masked, reduction="sum") / (B * mask_sum)
+        )
+
+        # For KLD normalization, use mask sum (analogous to Fourier case)
+        kld_norm = mask_sum
+
+    else:
+        # ORIGINAL FOURIER-SPACE LOSS
+        y = y.view(B, -1)[:, fourier_mask]
+        if dose_filters is not None:
+            y_recon = torch.mul(y_recon, dose_filters[:, fourier_mask])
+        gen_loss = F.mse_loss(y_recon, y)
+        kld_norm = fourier_mask.sum().float()
 
     # latent loss
     kld = torch.mean(
@@ -500,9 +673,9 @@ def loss_function(
 
     # total loss
     if beta_control is None:
-        loss = gen_loss + beta * kld / mask.sum().float()
+        loss = gen_loss + beta * kld / kld_norm
     else:
-        loss = gen_loss + beta_control * (beta - kld) ** 2 / mask.sum().float()
+        loss = gen_loss + beta_control * (beta - kld) ** 2 / kld_norm
 
     return loss, gen_loss, kld
 
@@ -601,6 +774,8 @@ def save_config(args, dataset, lattice, model, out_config):
         ctf=args.ctf,
         poses=args.poses,
         do_pose_sgd=args.do_pose_sgd,
+        focus_mask=args.focus_mask,
+        focus_mask_threshold=args.focus_mask_threshold,
     )
     if args.encode_mode == "tilt":
         dataset_args["ntilts"] = args.ntilts
@@ -726,6 +901,18 @@ def main(args: argparse.Namespace) -> None:
 
     if args.encode_mode == "conv":
         assert D - 1 == 64, "Image size must be 64x64 for convolutional encoder"
+
+    # load focus mask if provided
+    focus_mask = None
+    if args.focus_mask:
+        ny = D - 1  # Image size before symmetrization
+        focus_mask = load_focus_mask(
+            args.focus_mask,
+            ny,
+            device,
+            threshold=args.focus_mask_threshold,
+        )
+        logger.info(f"Using real-space focus mask for loss computation")
 
     # load poses
     pose_optimizer = None
@@ -970,6 +1157,8 @@ def main(args: argparse.Namespace) -> None:
                 use_amp=args.amp,
                 scaler=scaler,
                 dose_filters=dose_filters,
+                focus_mask=focus_mask,
+                data_norm=tuple(data.norm) if focus_mask is not None else None,
             )
             if pose_optimizer is not None and epoch >= args.pretrain:
                 pose_optimizer.step()
