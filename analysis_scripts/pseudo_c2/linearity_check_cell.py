@@ -1,15 +1,15 @@
 #@title Linearity check: is the J486 map the 2-fold swap of the J487 map? { display-mode: "form" }
 #@markdown Paste this into the **backproject notebook** and run it after cells 1.1–1.4 and 2.1–2.2 (cryoDRGN
-#@markdown installed, stack on local disk). Your existing files are only read; new files go to `OUT_DIR`.
+#@markdown installed, stack on local disk). Your existing files are only read. New maps go to `OUT_DIR`.
 #@markdown
-#@markdown 1. Pose check on the exact index file both swap maps used, including where the 2-fold axis must sit
-#@markdown    for the J486 and J487 shifts to agree.
-#@markdown 2. Three back-projections of the same particles (about 3 min each on a T4):
-#@markdown    `J487_rerun` = pose.pkl as is; `J487xC_t487` = J487 rotations · C with J487 shifts, the exact swap of
-#@markdown    M7 about the box origin; `J487xC_t486` = J487 rotations · C with J486 shifts, i.e. M6 without J486's
-#@markdown    rotation scatter.
-#@markdown 3. Correlations at `LOWPASS_A` between these, the maps Cowork analysed, and the swap operator
-#@markdown    derived from the poses (no operator is fitted to the maps).
+#@markdown 1. Pose check on the exact index file both swap maps used. It stops here if that set is not the
+#@markdown    swap class. It also finds where the 2-fold axis must sit for the J486 and J487 shifts to agree.
+#@markdown 2. Four back-projections of the same particles (about 3 min each on a T4):
+#@markdown    `J487_rerun` and `J486_rerun` repeat the two swap maps from the pose files as they are now;
+#@markdown    `J487xC_t487` = J487 rotations · C with J487 shifts, the exact swap of M7 about the box origin;
+#@markdown    `J487xC_t486` = J487 rotations · C with J486 shifts, i.e. M6 without J486's rotation scatter.
+#@markdown 3. Correlations, after the same `LOWPASS_A` filter `register_fraction.py` uses, between these maps,
+#@markdown    the maps Cowork analysed, and M7 swapped about the axis the shifts imply.
 POSE_J487 = "/content/drive/MyDrive/mina53_mpp6/pose.pkl"  #@param {type:"string"}
 POSE_J486 = "/content/drive/MyDrive/mina53_mpp6/pseudo_c2_check/pose_J486_in_J487_order.pkl"  #@param {type:"string"}
 IND = "/content/drive/MyDrive/mina53_mpp6/pseudo_c2_check/bp_J486/c2swap_J486.pkl"  #@param {type:"string"}
@@ -22,14 +22,19 @@ M7_NAME = "c2swap_J487_eq32638"  #@param {type:"string"}
 M6_NAME = "c2swap_J486_eq32638"  #@param {type:"string"}
 OUT_DIR = "/content/drive/MyDrive/mina53_mpp6/backproject/linearity"  #@param {type:"string"}
 LOCAL_DIR = "/content/cryodrgn_work/linearity"  #@param {type:"string"}
+#@markdown Must match the runs that made the maps (they used `--uninvert-data`).
 UNINVERT_DATA = True  #@param {type:"boolean"}
 LOWPASS_A = 8.0  #@param {type:"number"}
+#@markdown Mass for the molecular mask (dimer plus MPP6), as in `register_fraction.py`.
+MASK_KDA = 125.0  #@param {type:"number"}
 BATCH = 8  #@param {type:"integer"}
 
-import json, os, pickle, shutil, subprocess, sys, time
+import hashlib, json, os, pickle, shutil, subprocess, sys, time
 import numpy as np
 from scipy import ndimage, optimize
 from cryodrgn.mrcfile import parse_mrc
+
+CELL_VERSION = "2"
 
 
 def _load(p):
@@ -37,12 +42,14 @@ def _load(p):
         return pickle.load(f)
 
 
-def _dump(obj, p):
-    with open(p, "wb") as f:
+def _dump(obj, p):                                     # write-then-rename, so an interrupted write leaves nothing
+    with open(p + ".tmp", "wb") as f:
         pickle.dump(obj, f, protocol=4)
+    os.replace(p + ".tmp", p)
 
 
-for p in (POSE_J487, POSE_J486, IND, SUMMARY, PARTICLES) + ((CTF,) if CTF else ()):
+maps_in = {n: os.path.join(BP_DIR, d, "backproject.mrc") for n, d in (("V", V_NAME), ("M7", M7_NAME), ("M6", M6_NAME))}
+for p in (POSE_J487, POSE_J486, IND, SUMMARY, PARTICLES, *maps_in.values()) + ((CTF,) if CTF else ()):
     if not os.path.exists(p):
         raise FileNotFoundError(p + ("   <- run cells 2.1-2.2 of the backproject notebook first"
                                      if p == PARTICLES else ""))
@@ -67,61 +74,91 @@ def ang(Ra, Rb):                                       # rotation angle of Ra^T 
 
 
 R7, R6 = r7[ind], r6[ind]
-R7C = R7 @ C
-a76, a6c = ang(R7, R6), ang(R7C, R6)
+a76, a6c = ang(R7, R6), ang(R7 @ C, R6)
+sw = a6c < 60                                          # J486 ~ J487.C (the split's swap class reaches ~50 deg); a
+                                                       # random rotation lands here 6% of the time
+f_sw, f_id = sw.mean(), np.mean(a76 < 20)
 q = lambda a: f"median {np.median(a):6.1f}   5-95% {np.percentile(a, 5):5.1f}-{np.percentile(a, 95):5.1f}"
 print(f"axis u = ({u[0]:+.4f}, {u[1]:+.4f}, {u[2]:+.4f});  {len(ind):,} particles in {os.path.basename(IND)}")
-print(f"J486 vs J487     : {q(a76)} deg")
-print(f"J486 vs J487 . C : {q(a6c)} deg;  {np.mean(a6c < 10):.1%} within 10 deg of the swap, "
-      f"{np.mean(a76 < 10):.1%} within 10 deg of J487")
+print(f"J486 vs J487     : {q(a76)} deg;  {f_id:.1%} within 20 deg")
+print(f"J486 vs J487 . C : {q(a6c)} deg;  {f_sw:.1%} within 60 deg (swap-consistent)")
+if f_sw < 0.8:
+    why = ("J486 matches J487 at most of these rows, so this index file is not the c2_swap class" if f_id > 0.5 else
+           "J486 matches neither J487 nor J487 . C at most of these rows, so the J486 pose file is not in this row "
+           "order (or is not the J486 job)")
+    raise RuntimeError(f"STOPPED before back-projecting: only {f_sw:.0%} of {os.path.basename(IND)} are "
+                       f"swap-consistent. {why}. Both swap maps were made from this index file, so neither "
+                       f"is a map of swapped particles. Send me this output.")
 
-# Shifts. Pose translations are fractions of the box; report them in back-projection pixels and A.
-v0, h0 = parse_mrc(os.path.join(BP_DIR, M7_NAME, "backproject.mrc"))
+v0, h0 = parse_mrc(maps_in["M7"])
 D, apix = v0.shape[0], float(h0.apix)
-d = (t6[ind] - t7[ind]) * D                            # px at the back-projection box
+# Shifts: cryoDRGN multiplies the stored fraction by the symmetrised box D + 1 and shifts by that many pixels.
+d = (t6[ind] - t7[ind]) * (D + 1)
 dn = np.linalg.norm(d, axis=1)
-print(f"|t486 - t487|    : median {np.median(dn):.2f} px ({np.median(dn) * apix:.1f} A), "
-      f"95th {np.percentile(dn, 95):.2f} px  (box {D}, {apix:.4f} A/px)")
+print(f"|t486 - t487|    : median {np.median(dn[sw]):.2f} px ({np.median(dn[sw]) * apix:.1f} A), "
+      f"95th {np.percentile(dn[sw], 95):.2f} px on the swap-consistent rows  (box {D}, {apix:.4f} A/px)")
 
 # If the molecule's 2-fold passes through c rather than the box origin, swapping a particle also moves it:
-# d_i = P_i w with w = (I - C) c = 2 c_perp, P_i = first two rows of rot (cryoDRGN: x_image = rot . x_map).
-# Fit w robustly (trimmed least squares). The control uses the transposed rotation, which has no physical meaning.
+# d_i = P_i w with w = (I - C) c = 2 c_perp and P_i = the first two rows of rot (cryoDRGN: x_image = rot . x_map).
+# Fit w robustly (trimmed least squares) on the swap-consistent rows. The control uses the transposed rotation,
+# which has no physical meaning: the shift model should fit far better than the control.
 e1 = np.cross(u, [1.0, 0, 0] if abs(u[0]) < 0.9 else [0, 1.0, 0])
 e1 /= np.linalg.norm(e1)
 Bp = np.stack([e1, np.cross(u, e1)], 1)                # basis of the plane perpendicular to u
 
 
-def fit_shift(P):
+def fit_shift(P, dd):
     A = P @ Bp                                         # (n, 2, 2)
-    sel = np.ones(len(d), bool)
+    sel = np.ones(len(dd), bool)
     for _ in range(8):
-        x = np.linalg.lstsq(A[sel].reshape(-1, 2), d[sel].reshape(-1), rcond=None)[0]
-        res = np.linalg.norm(d - A @ x, axis=1)
+        x = np.linalg.lstsq(A[sel].reshape(-1, 2), dd[sel].reshape(-1), rcond=None)[0]
+        res = np.linalg.norm(dd - A @ x, axis=1)
         sel = res <= np.quantile(res, 0.8)
     return Bp @ x, res
 
 
-w_px, res = fit_shift(R7[:, :2, :])
-_, res_ctl = fit_shift(R7.transpose(0, 2, 1)[:, :2, :])
-c_px = w_px / 2                                        # axis offset from the box origin, perpendicular to u
-print(f"shift change explained by a 2-fold axis {np.linalg.norm(c_px) * apix:.1f} A from the box origin: "
-      f"median residual {np.median(res):.2f} px (from {np.median(dn):.2f}; control {np.median(res_ctl):.2f})")
+w_px, res = fit_shift(R7[sw, :2, :], d[sw])
+_, res_ctl = fit_shift(R7[sw].transpose(0, 2, 1)[:, :2, :], d[sw])
+# In cryoDRGN's convention (checked by back-projecting synthetic data with backproject_voxel), the axis sits at
+# c = -w / 2. The maps check this sign again in section 3.
+cS = -w_px / 2
+fit_ok = np.median(res) < 0.5 * np.median(res_ctl)
+print(f"shift change explained by a 2-fold axis {np.linalg.norm(cS) * apix:.1f} A from the box origin: "
+      f"median residual {np.median(res):.2f} px (from {np.median(dn[sw]):.2f}; control {np.median(res_ctl):.2f})"
+      + ("" if fit_ok else "   <- POOR FIT: the shift changes are not explained by one axis position"))
 
-# ------------------------------------------------------------------ 2. pose files and back-projections
+# ------------------------------------------------------------------ 2. back-projections (resumable)
 rC = np.einsum("nij,jk->nik", r7, C).astype(np.float32)
-jobs = {"J487_rerun": POSE_J487,
-        "J487xC_t487": os.path.join(OUT_DIR, "pose_J487xC_t487.pkl"),
-        "J487xC_t486": os.path.join(OUT_DIR, "pose_J487xC_t486.pkl")}
+ctf_sig = (os.path.getsize(CTF), int(os.path.getmtime(CTF))) if CTF else None
+ind_sha = hashlib.sha1(ind.tobytes()).hexdigest()
+
+
+def _file_sha(p):
+    h = hashlib.sha1()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+jobs = {"J487_rerun": (POSE_J487, _file_sha(POSE_J487)),
+        "J486_rerun": (POSE_J486, _file_sha(POSE_J486))}
 for name, tr in (("J487xC_t487", t7), ("J487xC_t486", t6)):
-    if not os.path.exists(jobs[name]):
-        _dump((rC, tr.astype(np.float32)), jobs[name])
+    pth = os.path.join(LOCAL_DIR, f"pose_{name}.pkl")
+    obj = (rC, tr.astype(np.float32))
+    _dump(obj, pth)
+    jobs[name] = (pth, hashlib.sha1(obj[0].tobytes() + obj[1].tobytes()).hexdigest())
 exe = shutil.which("cryodrgn") or os.path.join(os.path.dirname(sys.executable), "cryodrgn")
 maps_dir = {}
-for name, pose in jobs.items():
+for i, (name, (pose, pose_sha)) in enumerate(jobs.items(), 1):
     drv, loc = os.path.join(OUT_DIR, name), os.path.join(LOCAL_DIR, name)
     maps_dir[name] = drv
-    if os.path.exists(os.path.join(drv, "backproject.mrc")):
-        print(f"{name}: already made, reusing {drv}")
+    key = dict(cell=CELL_VERSION, poses=pose_sha, ind=ind_sha, ctf=ctf_sig, particles=os.path.abspath(PARTICLES),
+               particles_size=os.path.getsize(PARTICLES), uninvert=bool(UNINVERT_DATA), batch=int(BATCH))
+    key = json.loads(json.dumps(key))                  # tuples -> lists, as they read back from the manifest
+    man = os.path.join(drv, "inputs.json")             # written last: a folder without it is incomplete
+    if os.path.exists(man) and json.load(open(man)) == key and os.path.exists(os.path.join(drv, "backproject.mrc")):
+        print(f"[{i}/4] {name}: already made from these inputs, reusing {drv}")
         continue
     cmd = [exe, "backproject_voxel", PARTICLES, "--poses", pose, "--ind", IND, "-o", loc,
            "-b", str(int(BATCH)), "--reg-weight", "1.0", "--lazy"]
@@ -129,32 +166,61 @@ for name, pose in jobs.items():
         cmd += ["--ctf", CTF]
     if UNINVERT_DATA:
         cmd += ["--uninvert-data"]
+    print(f"[{i}/4] {name}: back-projecting {len(ind):,} particles ...", flush=True)
+    shutil.rmtree(loc, ignore_errors=True)
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode or not os.path.exists(os.path.join(loc, "backproject.mrc")):
         print(" ".join(cmd), "\n", r.stdout[-3000:], r.stderr[-3000:])
-        raise RuntimeError(f"{name}: backproject_voxel failed")
-    shutil.copytree(loc, drv, dirs_exist_ok=True)
-    print(f"{name}: back-projected in {(time.time() - t0) / 60:.1f} min -> {drv}")
+        raise RuntimeError(f"{name}: backproject_voxel failed (exit {r.returncode})")
+    shutil.rmtree(drv, ignore_errors=True)
+    shutil.copytree(loc, drv)
+    json.dump(key, open(man, "w"))
+    print(f"        done in {(time.time() - t0) / 60:.1f} min -> {drv}", flush=True)
 
 # ------------------------------------------------------------------ 3. maps
-def load(dr):
-    v, h = parse_mrc(os.path.join(dr, "backproject.mrc"))
-    return np.asarray(v, np.float64)
+def load(path):
+    return np.asarray(parse_mrc(path)[0], np.float64)
 
 
-raw = {"V": load(os.path.join(BP_DIR, V_NAME)), "M7": load(os.path.join(BP_DIR, M7_NAME)),
-       "M6": load(os.path.join(BP_DIR, M6_NAME)), "M7r": load(maps_dir["J487_rerun"]),
-       "M7C": load(maps_dir["J487xC_t487"]), "F": load(maps_dir["J487xC_t486"])}
-print("\nmap   min / max  (compare with the copies Cowork read)")
+raw = {n: load(p) for n, p in maps_in.items()}
+for n, j in (("M7r", "J487_rerun"), ("M6r", "J486_rerun"), ("M7C", "J487xC_t487"), ("F", "J487xC_t486")):
+    raw[n] = load(os.path.join(maps_dir[j], "backproject.mrc"))
+print("\nmap   min / max  (the copies Cowork read should match)")
 for k in ("V", "M7", "M6"):
     print(f"{k:4s} {raw[k].min():+.4f} / {raw[k].max():+.4f}")
 
 k = np.fft.fftfreq(D, d=apix)
-kk = k[:, None, None] ** 2 + k[None, :, None] ** 2 + k[None, None, :] ** 2
-filt = np.exp(-0.5 * kk * (LOWPASS_A / 1.6) ** 2)      # Gaussian, about 0.5 transmission at 1 / LOWPASS_A
-mp = {n: np.real(np.fft.ifftn(np.fft.fftn(v) * filt)) for n, v in raw.items()}
-env = ndimage.binary_dilation(mp["V"] > np.percentile(mp["V"], 90), iterations=3)
+s = np.sqrt(k[:, None, None] ** 2 + k[None, :, None] ** 2 + k[None, None, :] ** 2)
+
+
+def lowpass(v, res_A, width_px=3.0):                   # raised cosine, as register_fraction.lowpass_filter
+    ds = width_px / (D * apix)
+    f = 0.5 - 0.5 * np.cos(np.pi * np.clip((1 / res_A + ds / 2 - s) / ds, 0, 1))
+    return np.real(np.fft.ifftn(np.fft.fftn(v) * f))
+
+
+mp = {n: lowpass(v, LOWPASS_A) for n, v in raw.items()}
+
+# The swap as an array operation. cryoDRGN maps are indexed [z, y, x] with the origin at index D/2.
+Pm = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], float)
+Carr = Pm @ C @ Pm.T
+
+
+def swap(vol, c=np.zeros(3), order=1):                 # 2-fold about u through c (map-frame px from the origin)
+    q0 = D / 2 + Pm @ np.asarray(c, float)
+    return ndimage.affine_transform(vol, Carr, offset=q0 - Carr @ q0, order=order, mode="constant")
+
+
+# Molecular mask as in register_fraction.py (15 A map, volume of MASK_KDA, largest blob, 6 A dilation), made
+# symmetric under both swaps so that no comparison below is cut off by the mask.
+V15 = lowpass(raw["V"], 15.0)
+nvox = int(round(MASK_KDA * 1000 * 1.21 / apix ** 3))
+lab, nlab = ndimage.label(V15 >= np.partition(V15.ravel(), -nvox)[-nvox])
+blob = lab == 1 + int(np.argmax(ndimage.sum(np.ones_like(V15), lab, np.arange(1, nlab + 1))))
+blob = ndimage.distance_transform_edt(~blob) * apix <= 6.0
+env = blob | (swap(blob.astype(float), order=0) > 0.5) | (swap(blob.astype(float), cS, order=0) > 0.5)
+vox = np.argwhere(env).astype(float)
 
 
 def _cc(a, b):
@@ -163,79 +229,67 @@ def _cc(a, b):
     return float(a @ b / den) if den > 0 else float("nan")      # nan: one map is constant (e.g. M6 == M7)
 
 
-def corr(a, b, m=env):
-    return _cc(a[m], b[m])
+def corr(a, b):
+    return _cc(a[env], b[env])
 
 
-# The swap as an array operation. cryoDRGN maps are indexed [z, y, x] with the origin at index D/2.
-Pm = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], float)
-Carr = Pm @ C @ Pm.T
-vox = np.argwhere(env).astype(float)
-
-
-def swap(vol, c=np.zeros(3)):                          # 2-fold about u through c (map-frame px from the origin)
-    q0 = D / 2 + Pm @ np.asarray(c, float)
-    return ndimage.affine_transform(vol, Carr, offset=q0 - Carr @ q0, order=1, mode="constant")
-
-
-def corr_sw(a, b, c=np.zeros(3)):                      # corr(a, swap(b, c)) in the envelope, without a full resample
+def corr_sw(a, b, c=np.zeros(3)):                      # corr(a, swap(b, c)) in the mask, without a full resample
     q0 = D / 2 + Pm @ np.asarray(c, float)
     return _cc(a[env], ndimage.map_coordinates(b, ((vox - q0) @ Carr.T + q0).T, order=1, mode="constant"))
 
 
-conv = corr_sw(mp["M7C"], mp["M7r"])
-sgn = max((+1, -1), key=lambda s: corr_sw(mp["F"], mp["M7r"], s * c_px))
-cS = sgn * c_px                                        # axis position implied by the J486 - J487 shifts
-mp["S7"] = swap(mp["M7"], cS)                          # M7 swapped about that axis
+r_m7, r_m6 = corr(mp["M7"], mp["M7r"]), corr(mp["M6"], mp["M6r"])
+r_conv = corr_sw(mp["M7C"], mp["M7r"])
+r_FS, r_FSm = corr_sw(mp["F"], mp["M7r"], cS), corr_sw(mp["F"], mp["M7r"], -cS)
+mp["S7"] = swap(mp["M7r"], cS)                         # M7 swapped about the shift-derived axis
 
-names = ["V", "M7", "M7r", "M6", "F", "M7C", "S7"]
-print(f"\ncorrelation at {LOWPASS_A:g} A inside the envelope ({env.sum():,} voxels):")
+names = ["V", "M7", "M7r", "M6", "M6r", "F", "M7C", "S7"]
+print(f"\ncorrelation after a {LOWPASS_A:g} A low-pass, in a {MASK_KDA:g} kDa molecular mask ({env.sum():,} voxels):")
 print("       " + "".join(f"{n:>8s}" for n in names))
 for a in names:
     print(f"{a:>5s}  " + "".join(f"{corr(mp[a], mp[b]):8.4f}" for b in names))
-print("M7r = pose.pkl re-run; F = J487.C rotations + J486 shifts; M7C = J487.C rotations + J487 shifts;\n"
-      "S7 = M7 swapped (array operation) about the axis the J486 - J487 shifts imply.")
+print("M7r / M6r = the swap maps re-made from the current pose files; F = J487.C rotations + J486 shifts;\n"
+      "M7C = J487.C rotations + J487 shifts; S7 = M7r swapped (array operation) about the shift-derived axis.")
 
-# V's own best 2-fold axis position (what register_fraction.py refines), for comparison with the pose-derived one.
+# V's own best 2-fold axis position (u fixed, as register_fraction's nominal+offset), for comparison.
 best = min((optimize.minimize(lambda x: -corr_sw(mp["V"], mp["V"], Bp @ x), x0, method="Nelder-Mead",
                               options=dict(xatol=0.02, fatol=1e-6)) for x0 in (np.zeros(2), Bp.T @ cS)),
            key=lambda r: r.fun)
 cV = Bp @ best.x
 gap = np.linalg.norm(cV - cS) * apix
 
-r_conv, r_m7 = conv, corr(mp["M7"], mp["M7r"])
-r_6F, r_67, r_6S, r_6C = (corr(mp["M6"], mp[n]) for n in ("F", "M7", "S7", "M7C"))
-r_FS = corr_sw(mp["F"], mp["M7r"], cS)
-r_6V = corr_sw(mp["M6"], mp["M7"], cV)                 # what a check with V's own operator sees
-reg = corr(mp["M6"] - mp["M7"], mp["S7"] - mp["M7"])
+r_6F, r_67, r_6S, r_6C = (corr(mp["M6r"], mp[n]) for n in ("F", "M7r", "S7", "M7C"))
+r_6V = corr_sw(mp["M6r"], mp["M7r"], cV)               # what a check with V's own axis sees
+reg = corr(mp["M6r"] - mp["M7r"], mp["S7"] - mp["M7r"])
 print("\nCHECKS")
-print(f"  a. array convention  corr(M7C, swap(M7r))   = {r_conv:.4f}   (~1: the swap operator below is exact)")
-print(f"  b. M7 reproducible   corr(M7, M7r)          = {r_m7:.4f}   (~1: run 1 used pose.pkl on this set)")
-print(f"  c. M6 as logged      corr(M6, F)            = {r_6F:.4f}   vs corr(M6, M7) = {r_67:.4f}")
-print(f"  d. shifts = offset   corr(F, swap(M7r, c))  = {r_FS:.4f}   (axis {np.linalg.norm(cS) * apix:.1f} A "
-      f"from the origin)")
-print(f"  e. M6 vs swapped M7  corr(M6, S7) = {r_6S:.4f}   corr(M6, M7C) = {r_6C:.4f}   corr(M6, M7) = {r_67:.4f}")
-print(f"                       M7 swapped about V's own axis instead: corr(M6, .) = {r_6V:.4f}")
-print(f"  f. register          corr(M6 - M7, S7 - M7) = {reg:+.3f}   (+1: M6 is M7 swapped; ~0: it is not; "
-      "nan: M6 equals M7)")
+print(f"  a. M7 reproducible   corr(M7, M7r)          = {r_m7:.4f}   (~1: run 1 used pose.pkl on this index file)")
+print(f"  b. M6 reproducible   corr(M6, M6r)          = {r_m6:.4f}   (~1: run 2 used the current J486 pose file)")
+print(f"  c. array convention  corr(M7C, swap(M7r))   = {r_conv:.4f}   (~1: the swap operator below is exact)")
+print(f"  d. shift-derived axis corr(F, swap(M7r, c)) = {r_FS:.4f}   (opposite sign: {r_FSm:.4f}); axis "
+      f"{np.linalg.norm(cS) * apix:.1f} A from the origin")
+print(f"  e. M6r vs M7r        swapped about that axis {r_6S:.4f} | about the origin {r_6C:.4f} | "
+      f"about V's own axis {r_6V:.4f} | unswapped {r_67:.4f}   (F: {r_6F:.4f})")
+print(f"  f. register          corr(M6r - M7r, S7 - M7r) = {reg:+.3f}   (+1: M6 is M7 swapped; nan: M6 equals M7)")
 print(f"  g. operator match    V's own 2-fold axis: {np.linalg.norm(cV) * apix:.1f} A from the origin, {gap:.1f} A "
       f"from the shift-derived axis;  corr(V, swap V) {-best.fun:.4f} there vs {corr_sw(mp['V'], mp['V'], cS):.4f}")
 
 print("\nVERDICT")
+inv = "  A value near -1 would mean UNINVERT_DATA differs from that run." if min(r_m7, r_m6) < 0 else ""
+print("  M7 on Drive " + ("is pose.pkl back-projected on this index file (reproduced)." if r_m7 >= 0.995 else
+      "is NOT pose.pkl back-projected on this index file: run 1 used other inputs. Use J487_rerun as M7."))
+print("  M6 on Drive " + ("is the current J486 pose file back-projected on this index file (reproduced)."
+      if r_m6 >= 0.995 else "is NOT the current J486 pose file back-projected on this index file: run 2 used "
+      "other inputs, or the pose file was rewritten since. Use J486_rerun as M6.") + inv)
 if r_conv < 0.98:
     print("  The array convention check failed, so the operator comparisons are not interpretable. Send me the output.")
-elif r_m7 < 0.995:
-    print("  M7 on Drive is NOT pose.pkl applied to this index set: run 1 used other inputs. Use J487_rerun as M7.")
-elif r_6F <= r_67:
-    print("  M6 on Drive is closer to M7 than to the same particles with J487.C rotations and J486 shifts, so it is "
-          "not what the run-2 log says. Send me the output.")
-elif reg > 0.5:
-    print(f"  Both maps are what their labels say, and M6 is M7 swapped about an axis {np.linalg.norm(cS) * apix:.1f} A "
-          f"from the box origin (set by the J486 - J487 shift changes).")
-    print(f"  V's own 2-fold axis is {gap:.1f} A from that one. Swapping M7 about V's axis gives corr(M6, .) = "
-          f"{r_6V:.4f}, against {r_6S:.4f} about the shift-derived axis and {r_67:.4f} for M7 unswapped.")
-    print("  So a check that uses V's operator " + ("cannot pass: that operator is not the one relating M6 to M7. "
-          "This explains check (e)." if r_6V < r_67 else "should pass here; send me the output."))
+elif reg > 0.5 and r_6S > r_67 and r_FS > r_FSm:
+    print(f"  With the current pose files, M6 is M7 swapped about an axis {np.linalg.norm(cS) * apix:.1f} A from the "
+          f"box origin: the axis that the J486 - J487 shift changes imply"
+          + ("." if fit_ok else " (but the shift fit is poor, so its position is uncertain)."))
+    print(f"  V's own 2-fold axis is {gap:.1f} A from that one. Swapping M7 about V's axis gives {r_6V:.4f}, against "
+          f"{r_6S:.4f} about the shift-derived axis and {r_67:.4f} for M7 unswapped.")
+    print("  " + ("So a check that uses V's operator finds M6 closer to the unswapped M7, consistent with the failed "
+                  "check (e): that operator is not the one relating M6 to M7." if r_6V < r_67 else
+                  "So a check that uses V's operator should have found M6 to be the swap of M7. Send me the output."))
 else:
-    print("  Both maps are what their labels say, but M6 is not M7 swapped about the shift-derived axis. Compare F "
-          "with M7C (rows above) and send me the output.")
+    print("  M6 is not M7 swapped about the shift-derived axis (see e and f). Send me the output.")
