@@ -157,9 +157,14 @@ mp = {n: np.real(np.fft.ifftn(np.fft.fftn(v) * filt)) for n, v in raw.items()}
 env = ndimage.binary_dilation(mp["V"] > np.percentile(mp["V"], 90), iterations=3)
 
 
+def _cc(a, b):
+    a, b = a - a.mean(), b - b.mean()
+    den = np.sqrt((a @ a) * (b @ b))
+    return float(a @ b / den) if den > 0 else float("nan")      # nan: one map is constant (e.g. M6 == M7)
+
+
 def corr(a, b, m=env):
-    a, b = a[m] - a[m].mean(), b[m] - b[m].mean()
-    return float(a @ b / np.sqrt((a @ a) * (b @ b)))
+    return _cc(a[m], b[m])
 
 
 # The swap as an array operation. cryoDRGN maps are indexed [z, y, x] with the origin at index D/2.
@@ -175,10 +180,7 @@ def swap(vol, c=np.zeros(3)):                          # 2-fold about u through 
 
 def corr_sw(a, b, c=np.zeros(3)):                      # corr(a, swap(b, c)) in the envelope, without a full resample
     q0 = D / 2 + Pm @ np.asarray(c, float)
-    bs = ndimage.map_coordinates(b, ((vox - q0) @ Carr.T + q0).T, order=1, mode="constant")
-    av = a[env] - a[env].mean()
-    bs = bs - bs.mean()
-    return float(av @ bs / np.sqrt((av @ av) * (bs @ bs)))
+    return _cc(a[env], ndimage.map_coordinates(b, ((vox - q0) @ Carr.T + q0).T, order=1, mode="constant"))
 
 
 conv = corr_sw(mp["M7C"], mp["M7r"])
@@ -204,6 +206,7 @@ gap = np.linalg.norm(cV - cS) * apix
 r_conv, r_m7 = conv, corr(mp["M7"], mp["M7r"])
 r_6F, r_67, r_6S, r_6C = (corr(mp["M6"], mp[n]) for n in ("F", "M7", "S7", "M7C"))
 r_FS = corr_sw(mp["F"], mp["M7r"], cS)
+r_6V = corr_sw(mp["M6"], mp["M7"], cV)                 # what a check with V's own operator sees
 reg = corr(mp["M6"] - mp["M7"], mp["S7"] - mp["M7"])
 print("\nCHECKS")
 print(f"  a. array convention  corr(M7C, swap(M7r))   = {r_conv:.4f}   (~1: the swap operator below is exact)")
@@ -212,7 +215,9 @@ print(f"  c. M6 as logged      corr(M6, F)            = {r_6F:.4f}   vs corr(M6,
 print(f"  d. shifts = offset   corr(F, swap(M7r, c))  = {r_FS:.4f}   (axis {np.linalg.norm(cS) * apix:.1f} A "
       f"from the origin)")
 print(f"  e. M6 vs swapped M7  corr(M6, S7) = {r_6S:.4f}   corr(M6, M7C) = {r_6C:.4f}   corr(M6, M7) = {r_67:.4f}")
-print(f"  f. register          corr(M6 - M7, S7 - M7) = {reg:+.3f}   (+1: M6 is M7 swapped; ~0: it is not)")
+print(f"                       M7 swapped about V's own axis instead: corr(M6, .) = {r_6V:.4f}")
+print(f"  f. register          corr(M6 - M7, S7 - M7) = {reg:+.3f}   (+1: M6 is M7 swapped; ~0: it is not; "
+      "nan: M6 equals M7)")
 print(f"  g. operator match    V's own 2-fold axis: {np.linalg.norm(cV) * apix:.1f} A from the origin, {gap:.1f} A "
       f"from the shift-derived axis;  corr(V, swap V) {-best.fun:.4f} there vs {corr_sw(mp['V'], mp['V'], cS):.4f}")
 
@@ -227,9 +232,10 @@ elif r_6F <= r_67:
 elif reg > 0.5:
     print(f"  Both maps are what their labels say, and M6 is M7 swapped about an axis {np.linalg.norm(cS) * apix:.1f} A "
           f"from the box origin (set by the J486 - J487 shift changes).")
-    print(f"  V's own 2-fold axis is {gap:.1f} A from that one. " + (
-          "The difference is large enough that a check of M6 against M7 with V's operator fails, which is what "
-          "check (e) reported." if gap > 1.0 else "So check (e) should have passed; send me the output."))
+    print(f"  V's own 2-fold axis is {gap:.1f} A from that one. Swapping M7 about V's axis gives corr(M6, .) = "
+          f"{r_6V:.4f}, against {r_6S:.4f} about the shift-derived axis and {r_67:.4f} for M7 unswapped.")
+    print("  So a check that uses V's operator " + ("cannot pass: that operator is not the one relating M6 to M7. "
+          "This explains check (e)." if r_6V < r_67 else "should pass here; send me the output."))
 else:
     print("  Both maps are what their labels say, but M6 is not M7 swapped about the shift-derived axis. Compare F "
           "with M7C (rows above) and send me the output.")
