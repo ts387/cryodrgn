@@ -3,7 +3,8 @@
 #@markdown installed, stack on local disk). Your existing files are only read. New maps go to `OUT_DIR`.
 #@markdown
 #@markdown 1. Pose check on the exact index file both swap maps used. It stops here if that set is not the
-#@markdown    swap class. It also finds where the 2-fold axis must sit for the J486 and J487 shifts to agree.
+#@markdown    swap class. It also finds where the 2-fold axis must sit for the J486 and J487 shifts to agree,
+#@markdown    and whether J486's map frame is offset from J487's (from the concordant particles).
 #@markdown 2. Four back-projections of the same particles (about 3 min each on a T4):
 #@markdown    `J487_rerun` and `J486_rerun` repeat the two swap maps from the pose files as they are now;
 #@markdown    `J487xC_t487` = J487 rotations · C with J487 shifts, the exact swap of M7 about the box origin;
@@ -34,7 +35,7 @@ import numpy as np
 from scipy import ndimage, optimize
 from cryodrgn.mrcfile import parse_mrc
 
-CELL_VERSION = "2"
+CELL_VERSION = "3"
 
 
 def _load(p):
@@ -78,17 +79,18 @@ a76, a6c = ang(R7, R6), ang(R7 @ C, R6)
 sw = a6c < 60                                          # J486 ~ J487.C (the split's swap class reaches ~50 deg); a
                                                        # random rotation lands here 6% of the time
 f_sw, f_id = sw.mean(), np.mean(a76 < 20)
+f_no = 1 - f_sw - f_id
 q = lambda a: f"median {np.median(a):6.1f}   5-95% {np.percentile(a, 5):5.1f}-{np.percentile(a, 95):5.1f}"
 print(f"axis u = ({u[0]:+.4f}, {u[1]:+.4f}, {u[2]:+.4f});  {len(ind):,} particles in {os.path.basename(IND)}")
 print(f"J486 vs J487     : {q(a76)} deg;  {f_id:.1%} within 20 deg")
-print(f"J486 vs J487 . C : {q(a6c)} deg;  {f_sw:.1%} within 60 deg (swap-consistent)")
+print(f"J486 vs J487 . C : {q(a6c)} deg;  {f_sw:.1%} within 60 deg (swap-consistent);  {f_no:.1%} neither")
 if f_sw < 0.8:
-    why = ("J486 matches J487 at most of these rows, so this index file is not the c2_swap class" if f_id > 0.5 else
-           "J486 matches neither J487 nor J487 . C at most of these rows, so the J486 pose file is not in this row "
-           "order (or is not the J486 job)")
+    why = (f"{f_id:.0%} have J486 ~ J487, so this index file is not (only) the c2_swap class. Both swap maps were "
+           f"made from it, so neither is a map of swapped particles alone" if f_id >= f_no else
+           f"{f_no:.0%} have J486 unrelated to J487, so the J486 pose file does not match these rows (wrong row order, "
+           f"or not the J486 job). M7 may be fine; M6 was made with a mismatched pose file")
     raise RuntimeError(f"STOPPED before back-projecting: only {f_sw:.0%} of {os.path.basename(IND)} are "
-                       f"swap-consistent. {why}. Both swap maps were made from this index file, so neither "
-                       f"is a map of swapped particles. Send me this output.")
+                       f"swap-consistent; {why}. Send me this output.")
 
 v0, h0 = parse_mrc(maps_in["M7"])
 D, apix = v0.shape[0], float(h0.apix)
@@ -98,39 +100,75 @@ dn = np.linalg.norm(d, axis=1)
 print(f"|t486 - t487|    : median {np.median(dn[sw]):.2f} px ({np.median(dn[sw]) * apix:.1f} A), "
       f"95th {np.percentile(dn[sw], 95):.2f} px on the swap-consistent rows  (box {D}, {apix:.4f} A/px)")
 
+
+def fit_lin(A, dd):                                    # trimmed least squares for dd_i = A_i x; A: (n, 2, k)
+    sel = np.ones(len(dd), bool)
+    for _ in range(8):
+        x = np.linalg.lstsq(A[sel].reshape(-1, A.shape[2]), dd[sel].reshape(-1), rcond=None)[0]
+        res = np.linalg.norm(dd - A @ x, axis=1)
+        sel = res <= np.quantile(res, 0.8)
+    return x, res
+
+
+rng = np.random.default_rng(0)
+
+
+def boot_se(A, dd, scale, n=30):                       # bootstrap standard error of scale * x, in A
+    m = len(dd)
+    bs = np.array([fit_lin(A[j], dd[j])[0] for j in (rng.integers(0, m, m) for _ in range(n))]) @ scale.T
+    return float(np.sqrt(np.trace(np.cov(bs.T))) * apix)
+
+
+# J486 vs J487 map-frame offset y, from concordant particles outside the index set: d_i = P_i y.
+conc = ang(r7, r6) < 10
+conc[ind] = False
+ci = np.flatnonzero(conc)
+ci = rng.choice(ci, min(len(ci), 100_000), replace=False) if len(ci) else ci
+if len(ci) >= 100:
+    y_px = fit_lin(r7[ci, :2, :], (t6[ci] - t7[ci]) * (D + 1))[0]
+else:
+    y_px = np.zeros(3)
+frame_A = float(np.linalg.norm(y_px) * apix)
+print(f"J486 - J487 map-frame offset from {len(ci):,} concordant particles: {frame_A:.2f} A")
+
 # If the molecule's 2-fold passes through c rather than the box origin, swapping a particle also moves it:
 # d_i = P_i w with w = (I - C) c = 2 c_perp and P_i = the first two rows of rot (cryoDRGN: x_image = rot . x_map).
-# Fit w robustly (trimmed least squares) on the swap-consistent rows. The control uses the transposed rotation,
-# which has no physical meaning: the shift model should fit far better than the control.
+# In cryoDRGN's sign convention (checked by back-projecting synthetic data with backproject_voxel) c = -w / 2; the
+# maps check the sign again in section 3. A J486 frame offset y adds P_i C y on swapped rows.
 e1 = np.cross(u, [1.0, 0, 0] if abs(u[0]) < 0.9 else [0, 1.0, 0])
 e1 /= np.linalg.norm(e1)
 Bp = np.stack([e1, np.cross(u, e1)], 1)                # basis of the plane perpendicular to u
-
-
-def fit_shift(P, dd):
-    A = P @ Bp                                         # (n, 2, 2)
-    sel = np.ones(len(dd), bool)
-    for _ in range(8):
-        x = np.linalg.lstsq(A[sel].reshape(-1, 2), dd[sel].reshape(-1), rcond=None)[0]
-        res = np.linalg.norm(dd - A @ x, axis=1)
-        sel = res <= np.quantile(res, 0.8)
-    return Bp @ x, res
-
-
-w_px, res = fit_shift(R7[sw, :2, :], d[sw])
-_, res_ctl = fit_shift(R7[sw].transpose(0, 2, 1)[:, :2, :], d[sw])
-# In cryoDRGN's convention (checked by back-projecting synthetic data with backproject_voxel), the axis sits at
-# c = -w / 2. The maps check this sign again in section 3.
-cS = -w_px / 2
-fit_ok = np.median(res) < 0.5 * np.median(res_ctl)
-print(f"shift change explained by a 2-fold axis {np.linalg.norm(cS) * apix:.1f} A from the box origin: "
-      f"median residual {np.median(res):.2f} px (from {np.median(dn[sw]):.2f}; control {np.median(res_ctl):.2f})"
-      + ("" if fit_ok else "   <- POOR FIT: the shift changes are not explained by one axis position"))
+P7 = R7[sw, :2, :] @ Bp                                # (n, 2, 2)
+x_s, res = fit_lin(P7, d[sw])
+cS = -(Bp @ x_s) / 2                                   # axis relating M6 to M7, px from the box origin
+se_c = boot_se(P7, d[sw], -Bp / 2)
+x_f = fit_lin(P7, d[sw] - R7[sw, :2, :] @ (C @ y_px))[0]
+c_fr = -(Bp @ x_f) / 2                                 # the refinements' swap axis, J486 frame offset removed
+print(f"shift change explained by a 2-fold axis {np.linalg.norm(cS) * apix:.2f} +/- {se_c:.2f} A from the box "
+      f"origin ({sw.sum():,} rows; per-particle scatter after the fit, median {np.median(res):.2f} px)")
+if frame_A >= 0.5:
+    print(f"   with J486's frame offset removed, the refinements' swap axis is {np.linalg.norm(c_fr) * apix:.2f} A "
+          f"from the origin")
 
 # ------------------------------------------------------------------ 2. back-projections (resumable)
 rC = np.einsum("nij,jk->nik", r7, C).astype(np.float32)
-ctf_sig = (os.path.getsize(CTF), int(os.path.getmtime(CTF))) if CTF else None
 ind_sha = hashlib.sha1(ind.tobytes()).hexdigest()
+
+
+def _sig(p):
+    return [os.path.abspath(p), os.path.getsize(p), int(os.path.getmtime(p))]
+
+
+def _stack_sig(p):                                     # the list file and, for a .txt stack, the files it lists
+    out = [_sig(p)]
+    if p.endswith(".txt"):
+        base = os.path.dirname(os.path.abspath(p))
+        with open(p) as f:
+            for ln in (x.strip() for x in f):
+                if ln:
+                    m = ln if os.path.isabs(ln) else os.path.join(base, ln)
+                    out.append(_sig(m) if os.path.exists(m) else [m, None, None])
+    return out
 
 
 def _file_sha(p):
@@ -149,15 +187,20 @@ for name, tr in (("J487xC_t487", t7), ("J487xC_t486", t6)):
     _dump(obj, pth)
     jobs[name] = (pth, hashlib.sha1(obj[0].tobytes() + obj[1].tobytes()).hexdigest())
 exe = shutil.which("cryodrgn") or os.path.join(os.path.dirname(sys.executable), "cryodrgn")
+stack_sig = _stack_sig(PARTICLES)
+ctf_sig = _sig(CTF) if CTF else None
 maps_dir = {}
 for i, (name, (pose, pose_sha)) in enumerate(jobs.items(), 1):
     drv, loc = os.path.join(OUT_DIR, name), os.path.join(LOCAL_DIR, name)
     maps_dir[name] = drv
-    key = dict(cell=CELL_VERSION, poses=pose_sha, ind=ind_sha, ctf=ctf_sig, particles=os.path.abspath(PARTICLES),
-               particles_size=os.path.getsize(PARTICLES), uninvert=bool(UNINVERT_DATA), batch=int(BATCH))
-    key = json.loads(json.dumps(key))                  # tuples -> lists, as they read back from the manifest
+    key = json.loads(json.dumps(dict(cell=CELL_VERSION, poses=pose_sha, ind=ind_sha, ctf=ctf_sig, stack=stack_sig,
+                                     uninvert=bool(UNINVERT_DATA), batch=int(BATCH))))
     man = os.path.join(drv, "inputs.json")             # written last: a folder without it is incomplete
-    if os.path.exists(man) and json.load(open(man)) == key and os.path.exists(os.path.join(drv, "backproject.mrc")):
+    try:
+        same = json.load(open(man)) == key and os.path.exists(os.path.join(drv, "backproject.mrc"))
+    except (OSError, ValueError):
+        same = False
+    if same:
         print(f"[{i}/4] {name}: already made from these inputs, reusing {drv}")
         continue
     cmd = [exe, "backproject_voxel", PARTICLES, "--poses", pose, "--ind", IND, "-o", loc,
@@ -175,7 +218,9 @@ for i, (name, (pose, pose_sha)) in enumerate(jobs.items(), 1):
         raise RuntimeError(f"{name}: backproject_voxel failed (exit {r.returncode})")
     shutil.rmtree(drv, ignore_errors=True)
     shutil.copytree(loc, drv)
-    json.dump(key, open(man, "w"))
+    with open(man + ".tmp", "w") as f:
+        json.dump(key, f)
+    os.replace(man + ".tmp", man)
     print(f"        done in {(time.time() - t0) / 60:.1f} min -> {drv}", flush=True)
 
 # ------------------------------------------------------------------ 3. maps
@@ -251,45 +296,81 @@ for a in names:
 print("M7r / M6r = the swap maps re-made from the current pose files; F = J487.C rotations + J486 shifts;\n"
       "M7C = J487.C rotations + J487 shifts; S7 = M7r swapped (array operation) about the shift-derived axis.")
 
-# V's own best 2-fold axis position (u fixed, as register_fraction's nominal+offset), for comparison.
+# V's own best 2-fold axis position (u fixed, offset fitted), for comparison with the pose-derived axes.
 best = min((optimize.minimize(lambda x: -corr_sw(mp["V"], mp["V"], Bp @ x), x0, method="Nelder-Mead",
                               options=dict(xatol=0.02, fatol=1e-6)) for x0 in (np.zeros(2), Bp.T @ cS)),
            key=lambda r: r.fun)
 cV = Bp @ best.x
-gap = np.linalg.norm(cV - cS) * apix
+gap, gap_fr = np.linalg.norm(cV - cS) * apix, np.linalg.norm(cV - c_fr) * apix
 
 r_6F, r_67, r_6S, r_6C = (corr(mp["M6r"], mp[n]) for n in ("F", "M7r", "S7", "M7C"))
 r_6V = corr_sw(mp["M6r"], mp["M7r"], cV)               # what a check with V's own axis sees
 reg = corr(mp["M6r"] - mp["M7r"], mp["S7"] - mp["M7r"])
+anti = corr(mp["M6r"] - swap(mp["M6r"], cS), mp["M7r"] - mp["S7"])  # -1: M6 is M7 swapped; +1: same register
+tol = max(0.005, 3 * (1 - r_conv))
+ok_V = r_6S - r_6V <= tol                              # V's axis relates M6 to M7 as well as the shift-derived one
 print("\nCHECKS")
 print(f"  a. M7 reproducible   corr(M7, M7r)          = {r_m7:.4f}   (~1: run 1 used pose.pkl on this index file)")
 print(f"  b. M6 reproducible   corr(M6, M6r)          = {r_m6:.4f}   (~1: run 2 used the current J486 pose file)")
 print(f"  c. array convention  corr(M7C, swap(M7r))   = {r_conv:.4f}   (~1: the swap operator below is exact)")
 print(f"  d. shift-derived axis corr(F, swap(M7r, c)) = {r_FS:.4f}   (opposite sign: {r_FSm:.4f}); axis "
-      f"{np.linalg.norm(cS) * apix:.1f} A from the origin")
+      f"{np.linalg.norm(cS) * apix:.2f} +/- {se_c:.2f} A from the origin")
 print(f"  e. M6r vs M7r        swapped about that axis {r_6S:.4f} | about the origin {r_6C:.4f} | "
       f"about V's own axis {r_6V:.4f} | unswapped {r_67:.4f}   (F: {r_6F:.4f})")
-print(f"  f. register          corr(M6r - M7r, S7 - M7r) = {reg:+.3f}   (+1: M6 is M7 swapped; nan: M6 equals M7)")
-print(f"  g. operator match    V's own 2-fold axis: {np.linalg.norm(cV) * apix:.1f} A from the origin, {gap:.1f} A "
-      f"from the shift-derived axis;  corr(V, swap V) {-best.fun:.4f} there vs {corr_sw(mp['V'], mp['V'], cS):.4f}")
+print(f"  f. register          corr(M6r - M7r, S7 - M7r) = {reg:+.3f} (+1: swapped);  antisymmetric parts "
+      f"{anti:+.3f} (-1: swapped, +1: same register)")
+print(f"  g. operator match    V's own 2-fold axis: {np.linalg.norm(cV) * apix:.2f} A from the origin, {gap:.2f} A "
+      f"from the shift-derived axis" + (f" ({gap_fr:.2f} A after removing J486's frame offset)" if frame_A >= 0.5
+      else "") + f";  corr(V, swap V) {-best.fun:.4f} there vs {corr_sw(mp['V'], mp['V'], cS):.4f}")
+print(f"     map frames      J486 - J487 offset {frame_A:.2f} A (concordant particles)")
 
 print("\nVERDICT")
+prov_ok = r_m7 >= 0.999 and r_m6 >= 0.999
 inv = "  A value near -1 would mean UNINVERT_DATA differs from that run." if min(r_m7, r_m6) < 0 else ""
-print("  M7 on Drive " + ("is pose.pkl back-projected on this index file (reproduced)." if r_m7 >= 0.995 else
-      "is NOT pose.pkl back-projected on this index file: run 1 used other inputs. Use J487_rerun as M7."))
+print("  M7 on Drive " + ("is pose.pkl back-projected on this index file (reproduced)." if r_m7 >= 0.999 else
+      f"is NOT pose.pkl back-projected on this index file (corr {r_m7:.4f}): run 1 used other inputs. "
+      "Use J487_rerun as M7."))
 print("  M6 on Drive " + ("is the current J486 pose file back-projected on this index file (reproduced)."
-      if r_m6 >= 0.995 else "is NOT the current J486 pose file back-projected on this index file: run 2 used "
-      "other inputs, or the pose file was rewritten since. Use J486_rerun as M6.") + inv)
-if r_conv < 0.98:
+      if r_m6 >= 0.999 else f"is NOT the current J486 pose file back-projected on this index file (corr {r_m6:.4f}): "
+      "run 2 used other inputs, or the pose file was rewritten since. Use J486_rerun as M6.") + inv)
+pre = "  " if prov_ok else "  On the re-runs: "
+swapped = r_6S > r_67 and r_FS >= r_FSm - 1e-3 and (reg > 0.5 or anti < -0.2)
+if not r_conv >= 0.98:
     print("  The array convention check failed, so the operator comparisons are not interpretable. Send me the output.")
-elif reg > 0.5 and r_6S > r_67 and r_FS > r_FSm:
-    print(f"  With the current pose files, M6 is M7 swapped about an axis {np.linalg.norm(cS) * apix:.1f} A from the "
-          f"box origin: the axis that the J486 - J487 shift changes imply"
-          + ("." if fit_ok else " (but the shift fit is poor, so its position is uncertain)."))
-    print(f"  V's own 2-fold axis is {gap:.1f} A from that one. Swapping M7 about V's axis gives {r_6V:.4f}, against "
-          f"{r_6S:.4f} about the shift-derived axis and {r_67:.4f} for M7 unswapped.")
-    print("  " + ("So a check that uses V's operator finds M6 closer to the unswapped M7, consistent with the failed "
-                  "check (e): that operator is not the one relating M6 to M7." if r_6V < r_67 else
-                  "So a check that uses V's operator should have found M6 to be the swap of M7. Send me the output."))
+elif swapped:
+    print(pre + f"M6 is M7 swapped about an axis {np.linalg.norm(cS) * apix:.2f} +/- {se_c:.2f} A from the box "
+          f"origin, the axis the J486 - J487 shift changes imply"
+          + ("." if reg > 0.5 else f" (reg {reg:+.2f} is low because M6r is blurrier than M7r; the antisymmetric "
+                                   f"test, {anti:+.2f}, still shows the swap)."))
+    if frame_A < 0.5:
+        print(f"  J486 and J487 share a map frame (offset {frame_A:.2f} A), so this is the swap the two refinements "
+              f"applied to these particles.")
+    else:
+        print(f"  J486's map frame is offset {frame_A:.2f} A from J487's. Without that offset the refinements' swap "
+              f"axis is {gap_fr:.2f} A from V's own axis.")
+    if ok_V:
+        print(f"  V's own 2-fold axis ({gap:.2f} A away) also relates M6 to M7: swapping about it gives {r_6V:.4f}, "
+              f"against {r_6S:.4f}.")
+        if r_6S < 0.98:
+            print(f"  But M6r is blurrier than M7r, so even the exact swap reaches only {r_6S:.4f}: check (e)'s 0.98 "
+                  "bar cannot be met with these maps, whichever operator is used. Send me the output.")
+        else:
+            print("  " + ("So check (e) with V's operator should have passed on these maps. Send me the output."
+                          if prov_ok else "So check (e) should pass on the re-runs; the Drive map that did not "
+                          "reproduce is what failed it. Re-run register_fraction.py with J487_rerun and J486_rerun."))
+    else:
+        print(f"  V's own 2-fold axis is {gap:.2f} A from that one, and swapping M7 about it gives only {r_6V:.4f} "
+              f"(against {r_6S:.4f}). A check that uses V's operator therefore fails, as check (e) did"
+              + ("." if prov_ok else ", whatever the Drive map that did not reproduce contributes."))
+        if frame_A < 0.5:
+            print("  The refinements swapped these particles about the shift-derived axis, not V's, so a register "
+                  "fraction estimated with V's axis (as register_fraction.py does) is biased. Send me this output and "
+                  "I will set the estimate up with the shift-derived axis.")
+        elif gap_fr <= 1.0:
+            print("  Most of that gap is J486's frame offset: V's axis remains the one to use for p(M7), and M6 must "
+                  "be translated by the frame offset before comparing it with M7. Send me this output.")
+        else:
+            print(f"  J486's frame offset explains only part of it: the refinements' swap axis is still {gap_fr:.2f} A "
+                  "from V's. Send me this output.")
 else:
-    print("  M6 is not M7 swapped about the shift-derived axis (see e and f). Send me the output.")
+    print(pre + "M6 is not M7 swapped about the shift-derived axis (see e and f). Send me the output.")
